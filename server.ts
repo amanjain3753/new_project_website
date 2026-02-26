@@ -1,215 +1,198 @@
 import express from "express";
-import Database from "better-sqlite3";
+import mongoose from "mongoose";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const isProd = process.env.NODE_ENV === "production";
-const dbPath = isProd ? path.join("/tmp", "coupons.db") : "coupons.db";
-const db = new Database(dbPath);
-
-// Initialize Database
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE,
-    password TEXT,
-    role TEXT DEFAULT 'user',
-    wallet_balance REAL DEFAULT 0,
-    is_suspended INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS coupons (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    seller_id INTEGER,
-    title TEXT,
-    platform TEXT,
-    discount_type TEXT,
-    code TEXT,
-    expiry_date DATE,
-    price REAL,
-    description TEXT,
-    status TEXT DEFAULT 'available',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(seller_id) REFERENCES users(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    buyer_id INTEGER,
-    seller_id INTEGER,
-    coupon_id INTEGER,
-    amount REAL,
-    commission REAL,
-    seller_amount REAL,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(buyer_id) REFERENCES users(id),
-    FOREIGN KEY(seller_id) REFERENCES users(id),
-    FOREIGN KEY(coupon_id) REFERENCES coupons(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS withdraw_requests (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    amount REAL,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-`);
-
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
+
+// --- MongoDB Connection ---
+const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/couponswap";
+
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log("✅ MongoDB Connected!"))
+  .catch(err => console.error("❌ MongoDB Connection Error:", err));
+
+// --- Schemas ---
+const userSchema = new mongoose.Schema({
+  email: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  role: { type: String, default: 'user' },
+  wallet_balance: { type: Number, default: 0 },
+  is_suspended: { type: Boolean, default: false },
+  created_at: { type: Date, default: Date.now }
+});
+
+const couponSchema = new mongoose.Schema({
+  seller_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  title: String,
+  platform: String,
+  discount_type: String,
+  code: String,
+  expiry_date: Date,
+  price: Number,
+  description: String,
+  status: { type: String, default: 'available' },
+  created_at: { type: Date, default: Date.now }
+});
+
+const transactionSchema = new mongoose.Schema({
+  buyer_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  seller_id: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  coupon_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon' },
+  amount: Number,
+  commission: Number,
+  seller_amount: Number,
+  created_at: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', userSchema);
+const Coupon = mongoose.model('Coupon', couponSchema);
+const Transaction = mongoose.model('Transaction', transactionSchema);
 
 app.use(express.json());
 
 // --- API Routes ---
 
-// Auth (Mock for now, using simple email/password)
-app.post("/api/auth/register", (req, res) => {
+app.post("/api/auth/register", async (req, res) => {
   const { email, password } = req.body;
   try {
-    const stmt = db.prepare("INSERT INTO users (email, password) VALUES (?, ?)");
-    const result = stmt.run(email, password);
-    res.json({ id: result.lastInsertRowid, email, role: 'user' });
+    const user = new User({ email, password });
+    await user.save();
+    res.json({ id: user._id, email, role: 'user' });
   } catch (e) {
     res.status(400).json({ error: "User already exists" });
   }
 });
 
-app.post("/api/auth/login", (req, res) => {
+app.post("/api/auth/login", async (req, res) => {
   const { email, password } = req.body;
-  const user = db.prepare("SELECT * FROM users WHERE email = ? AND password = ?").get(email, password);
+  const user = await User.findOne({ email, password });
   if (user) {
     if (user.is_suspended) return res.status(403).json({ error: "Account suspended" });
-    res.json({ id: user.id, email: user.email, role: user.role });
+    res.json({ id: user._id, email: user.email, role: user.role });
   } else {
     res.status(401).json({ error: "Invalid credentials" });
   }
 });
 
-// Coupons
-app.get("/api/coupons", (req, res) => {
+app.get("/api/coupons", async (req, res) => {
   const { platform, minPrice, maxPrice, search } = req.query;
-  let query = "SELECT id, title, platform, discount_type, expiry_date, price, description, seller_id FROM coupons WHERE status = 'available'";
-  const params: any[] = [];
+  let filter: any = { status: 'available' };
 
-  if (platform) {
-    query += " AND platform = ?";
-    params.push(platform);
-  }
-  if (minPrice) {
-    query += " AND price >= ?";
-    params.push(Number(minPrice));
-  }
-  if (maxPrice) {
-    query += " AND price <= ?";
-    params.push(Number(maxPrice));
+  if (platform) filter.platform = platform;
+  if (minPrice || maxPrice) {
+    filter.price = {};
+    if (minPrice) filter.price.$gte = Number(minPrice);
+    if (maxPrice) filter.price.$lte = Number(maxPrice);
   }
   if (search) {
-    query += " AND (title LIKE ? OR description LIKE ?)";
-    params.push(`%${search}%`, `%${search}%`);
+    filter.$or = [
+      { title: { $regex: search, $options: 'i' } },
+      { description: { $regex: search, $options: 'i' } }
+    ];
   }
 
-  const coupons = db.prepare(query).all(...params);
-  res.json(coupons);
+  const coupons = await Coupon.find(filter);
+  res.json(coupons.map(c => ({ ...c.toObject(), id: c._id })));
 });
 
-app.post("/api/coupons", (req, res) => {
-  const { seller_id, title, platform, discount_type, code, expiry_date, price, description } = req.body;
-  const stmt = db.prepare(`
-    INSERT INTO coupons (seller_id, title, platform, discount_type, code, expiry_date, price, description)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const result = stmt.run(seller_id, title, platform, discount_type, code, expiry_date, price, description);
-  res.json({ id: result.lastInsertRowid });
+app.post("/api/coupons", async (req, res) => {
+  try {
+    const coupon = new Coupon(req.body);
+    await coupon.save();
+    res.json({ id: coupon._id });
+  } catch (e) {
+    res.status(400).json({ error: "Failed to list coupon" });
+  }
 });
 
-// Buying
-app.post("/api/purchase", (req, res) => {
+app.post("/api/purchase", async (req, res) => {
   const { buyer_id, coupon_id } = req.body;
   
-  const dbTransaction = db.transaction(() => {
-    const coupon = db.prepare("SELECT * FROM coupons WHERE id = ? AND status = 'available'").get(coupon_id);
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const coupon = await Coupon.findOne({ _id: coupon_id, status: 'available' }).session(session);
     if (!coupon) throw new Error("Coupon not available");
 
     const amount = coupon.price;
     const commission = amount * 0.01;
     const seller_amount = amount - commission;
 
-    // Update coupon status
-    db.prepare("UPDATE coupons SET status = 'sold' WHERE id = ?").run(coupon_id);
+    coupon.status = 'sold';
+    await coupon.save({ session });
 
-    // Create transaction record
-    db.prepare(`
-      INSERT INTO transactions (buyer_id, seller_id, coupon_id, amount, commission, seller_amount)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(buyer_id, coupon.seller_id, coupon_id, amount, commission, seller_amount);
+    const transaction = new Transaction({
+      buyer_id,
+      seller_id: coupon.seller_id,
+      coupon_id,
+      amount,
+      commission,
+      seller_amount
+    });
+    await transaction.save({ session });
 
-    // Update seller wallet
-    db.prepare("UPDATE users SET wallet_balance = wallet_balance + ? WHERE id = ?").run(seller_amount, coupon.seller_id);
+    await User.findByIdAndUpdate(coupon.seller_id, { $inc: { wallet_balance: seller_amount } }).session(session);
 
-    return { code: coupon.code };
-  });
-
-  try {
-    const result = dbTransaction();
-    res.json(result);
+    await session.commitTransaction();
+    res.json({ code: coupon.code });
   } catch (e: any) {
+    await session.abortTransaction();
     res.status(400).json({ error: e.message });
+  } finally {
+    session.endSession();
   }
 });
 
-// User Dashboard / Wallet
-app.get("/api/users/:id/wallet", (req, res) => {
-  const user = db.prepare("SELECT wallet_balance FROM users WHERE id = ?").get(req.params.id);
+app.get("/api/users/:id/wallet", async (req, res) => {
+  const user = await User.findById(req.params.id).select('wallet_balance');
   res.json(user);
 });
 
-app.get("/api/users/:id/transactions", (req, res) => {
-  const transactions = db.prepare(`
-    SELECT t.*, c.title as coupon_title 
-    FROM transactions t 
-    JOIN coupons c ON t.coupon_id = c.id 
-    WHERE t.buyer_id = ? OR t.seller_id = ?
-    ORDER BY t.created_at DESC
-  `).all(req.params.id, req.params.id);
-  res.json(transactions);
+app.get("/api/users/:id/transactions", async (req, res) => {
+  const transactions = await Transaction.find({
+    $or: [{ buyer_id: req.params.id }, { seller_id: req.params.id }]
+  }).populate('coupon_id', 'title').sort({ created_at: -1 });
+  
+  res.json(transactions.map(t => ({
+    ...t.toObject(),
+    coupon_title: (t.coupon_id as any)?.title
+  })));
 });
 
-app.get("/api/users/:id/coupons", (req, res) => {
-  const coupons = db.prepare("SELECT * FROM coupons WHERE seller_id = ?").all(req.params.id);
+app.get("/api/users/:id/coupons", async (req, res) => {
+  const coupons = await Coupon.find({ seller_id: req.params.id });
   res.json(coupons);
 });
 
 // Admin
-app.get("/api/admin/stats", (req, res) => {
-  const totalCommission = db.prepare("SELECT SUM(commission) as total FROM transactions").get();
-  const totalUsers = db.prepare("SELECT COUNT(*) as count FROM users").get();
-  const totalCoupons = db.prepare("SELECT COUNT(*) as count FROM coupons").get();
-  const totalTransactions = db.prepare("SELECT COUNT(*) as count FROM transactions").get();
+app.get("/api/admin/stats", async (req, res) => {
+  const stats = await Transaction.aggregate([
+    { $group: { _id: null, totalCommission: { $sum: "$commission" }, count: { $sum: 1 } } }
+  ]);
+  const userCount = await User.countDocuments();
+  const couponCount = await Coupon.countDocuments();
+
   res.json({
-    totalCommission: totalCommission.total || 0,
-    totalUsers: totalUsers.count,
-    totalCoupons: totalCoupons.count,
-    totalTransactions: totalTransactions.count
+    totalCommission: stats[0]?.totalCommission || 0,
+    totalUsers: userCount,
+    totalCoupons: couponCount,
+    totalTransactions: stats[0]?.count || 0
   });
 });
 
-app.get("/api/admin/users", (req, res) => {
-  const users = db.prepare("SELECT id, email, role, wallet_balance, is_suspended, created_at FROM users").all();
+app.get("/api/admin/users", async (req, res) => {
+  const users = await User.find().select('-password');
   res.json(users);
 });
 
-app.post("/api/admin/users/:id/suspend", (req, res) => {
+app.post("/api/admin/users/:id/suspend", async (req, res) => {
   const { is_suspended } = req.body;
-  db.prepare("UPDATE users SET is_suspended = ? WHERE id = ?").run(is_suspended ? 1 : 0, req.params.id);
+  await User.findByIdAndUpdate(req.params.id, { is_suspended });
   res.json({ success: true });
 });
 
