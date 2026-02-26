@@ -65,7 +65,7 @@ db.exec(`
 `);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
@@ -211,6 +211,27 @@ app.post("/api/admin/users/:id/suspend", (req, res) => {
   const { is_suspended } = req.body;
   db.prepare("UPDATE users SET is_suspended = ? WHERE id = ?").run(is_suspended ? 1 : 0, req.params.id);
   res.json({ success: true });
+});
+
+// --- SECRET EXPORT ROUTE (To get your data back) ---
+app.get("/api/admin/backup-data-json", (req, res) => {
+  try {
+    const users = db.prepare("SELECT * FROM users").all();
+    const coupons = db.prepare("SELECT * FROM coupons").all();
+    const transactions = db.prepare("SELECT * FROM transactions").all();
+    
+    res.json({
+      message: "Yahan tera saara data hai. Isse copy karke save kar le!",
+      timestamp: new Date().toISOString(),
+      data: {
+        users,
+        coupons,
+        transactions
+      }
+    });
+  } catch (e: any) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Vite middleware for development
