@@ -1,0 +1,5 @@
+{
+  "name": "CouponSwap - Unused Coupon Marketplace",
+  "description": "A secure platform to buy and sell unused coupon codes from PhonePe, GPay, Amazon, and more. Features a wallet system, admin dashboard, and 1% commission model.",
+  "requestFramePermissions": []
+}
